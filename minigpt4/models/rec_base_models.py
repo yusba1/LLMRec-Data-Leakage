@@ -748,13 +748,16 @@ class Dice(nn.Module):
 
     def forward(self, x):
         assert x.dim() == self.dim
-        if self.dim == 2:
-            x_p = self.sigmoid(self.bn(x))
-            out = self.alpha * (1 - x_p) * x + x_p * x
-        else:
+        if self.dim == 3:
             x = torch.transpose(x, 1, 2)
-            x_p = self.sigmoid(self.bn(x))
-            out = self.alpha * (1 - x_p) * x + x_p * x
+        if self.bn.training and x.numel() // x.shape[1] == 1:
+            normalized = F.batch_norm(x, self.bn.running_mean, self.bn.running_var,
+                                      self.bn.weight, self.bn.bias, training=False, eps=self.bn.eps)
+        else:
+            normalized = self.bn(x)
+        x_p = self.sigmoid(normalized)
+        out = self.alpha * (1 - x_p) * x + x_p * x
+        if self.dim == 3:
             out = torch.transpose(out, 1, 2)
         return out
     
@@ -907,8 +910,8 @@ class RecEncoder_DIN(nn.Module):
     
     def all_encode(self, users,items,seqs):
         # sparse_inputs, sequence_inputs = inputs
-        user_emb = self.embed_layers[0](users.squeeze())
-        item_emb = self.embed_layers[1](items.squeeze())
+        user_emb = self.embed_layers[0](users.reshape(-1))
+        item_emb = self.embed_layers[1](items.reshape(-1))
         sequence_inputs = (seqs,)
         rec_his_emb = torch.cat(
             [self.sequence_embed_layers[i](sequence_inputs[i].squeeze_(1))

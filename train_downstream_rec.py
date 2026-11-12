@@ -1,83 +1,104 @@
+"""Train and evaluate one CoLLM recommender with a Clean or Dirty upstream backbone."""
 import argparse
-import random
-import numpy as np
+import json
+
 import pandas as pd
 import torch
-import torch.backends.cudnn as cudnn
+from omegaconf import OmegaConf
 
-import minigpt4.tasks as tasks
-from minigpt4.common.config import Config
-from minigpt4.common.dist_utils import get_rank, init_distributed_mode
-from minigpt4.common.logger import setup_logger
-from minigpt4.common.registry import registry
-from minigpt4.common.utils import now
+from leakage.common import load_config, require_empty_output, resolve_path, seed_everything, sha256, write_json
+from leakage.data import dimensions, load_splits
+from leakage.metrics import ranking_metrics
+from leakage.training import evaluate, fit, loader
+from minigpt4.models.minigpt4rec_v2 import MiniGPT4Rec_v2
 
-# imports modules for registration
-from minigpt4.datasets.builders import *
-from minigpt4.models import *
-from minigpt4.processors import *
-from minigpt4.runners import *
-from minigpt4.tasks import *
-from torch.distributed.elastic.multiprocessing.errors import *
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Training Downstream Recommendation Model")
-    parser.add_argument("--cfg-path", required=True, help="path to configuration file.")
-    parser.add_argument("--options", nargs="+", help="override some settings in the used config")
-    return parser.parse_args()
+def select_stage(model, stage):
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad = (name.startswith("llama_proj.") if stage == "alignment" else "lora_" in name)
+        if parameter.requires_grad:
+            parameter.data = parameter.data.float()
 
-def setup_seeds(config):
-    seed = config.run_cfg.seed + get_rank()
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    cudnn.benchmark = False
-    cudnn.deterministic = True
 
-def get_runner_class(cfg):
-    return registry.get_runner_class(cfg.run_cfg.get("runner", "rec_runner_base"))
+def loss_function(model, batch):
+    return model.forward_v2(batch)["loss"]
 
-@record
+
+def score_function(model, batch):
+    return model.generate_for_samples_v2(batch)["logits"]
+
+
 def main():
-    job_id = now()
-    cfg = Config(parse_args())
-    init_distributed_mode(cfg.run_cfg)
-    setup_seeds(cfg)
-    setup_logger()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--method", choices=["CoLLM-MF", "CoLLM-DIN"], required=True)
+    parser.add_argument("--backbone", choices=["clean", "dirty"], required=True)
+    parser.add_argument("--rec-checkpoint", required=True)
+    parser.add_argument("--upstream-adapter")
+    parser.add_argument("--exposed-id")
+    parser.add_argument("--output-dir", required=True)
+    args = parser.parse_args()
+    if (args.backbone == "dirty") != bool(args.upstream_adapter):
+        parser.error("Supply --upstream-adapter for Dirty only.")
+    config = load_config(args.config)
+    seed_everything(config["seed"])
+    if not torch.cuda.is_available():
+        raise RuntimeError("CoLLM training requires a CUDA environment.")
+    if config["history_length"] != 10 and args.method == "CoLLM-DIN":
+        raise ValueError("The supplied DIN encoder uses a history length of 10.")
+    directory = resolve_path(config["data_dir"])
+    frames = load_splits(directory)
+    users, items = dimensions(frames)
+    specification = config["methods"][args.method]
+    checkpoint = resolve_path(args.rec_checkpoint)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    model_config = load_config(resolve_path(specification["model_config"]))["model"]
+    model_config.update({"llama_model": str(resolve_path(config["base_model"])),
+                         "upstream_adapter": str(resolve_path(args.upstream_adapter)) if args.upstream_adapter else None,
+                         "prompt_path": str(resolve_path(model_config["prompt_path"])),
+                         "freeze_rec": True, "freeze_proj": False, "freeze_lora": True, "ckpt": None,
+                         "initialization_seed": config["seed"]})
+    model_config["rec_config"] = {**specification["encoder"], "user_num": users,
+                                  "item_num": items, "pretrained_path": str(checkpoint)}
+    model_config["lora_config"] = {"use_lora": True, "r": config["downstream"]["lora"]["rank"],
+                                   "alpha": config["downstream"]["lora"]["alpha"],
+                                   "dropout": config["downstream"]["lora"]["dropout"],
+                                   "target_modules": config["downstream"]["lora"]["target_modules"]}
+    model = MiniGPT4Rec_v2.from_config(OmegaConf.create(model_config)).cuda()
+    model.set_mode("v2")
+    if config["downstream"]["gradient_checkpointing"]:
+        model.llama_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.llama_model.enable_input_require_grads()
+    output = require_empty_output(resolve_path(args.output_dir))
+    write_json(output / "resolved_config.json", {"experiment": config, "model": model_config, "backbone": args.backbone})
+    for stage in ("alignment", "finetuning"):
+        select_stage(model, stage)
+        fit(model, frames, specification[stage], loss_function, score_function, output / stage,
+            config["seed"], config["history_length"], amp=True)
+    test_loader = loader(frames["test"], specification["finetuning"]["eval_batch_size"],
+                         config["history_length"], False, config["seed"])
+    metrics, scores = evaluate(model, test_loader, score_function, torch.device("cuda"))
+    predictions = frames["test"][["record_id", "uid", "iid", "label"]].copy()
+    predictions["score"] = scores
+    predictions.to_csv(output / "test_predictions.csv", index=False)
+    result = {"dataset": config["dataset"], "method": args.method, "backbone": args.backbone,
+              "split": "test", **metrics, "data_sha256": {split: sha256(directory / f"{split}_ood2.pkl") for split in frames},
+              "rec_checkpoint_sha256": sha256(checkpoint), "seed": config["seed"]}
+    if args.exposed_id:
+        exposed = json.loads(resolve_path(args.exposed_id).read_text(encoding="utf-8"))
+        pairs = set(map(tuple, exposed["pairs"]))
+        seen = pd.Series([(int(u), int(i)) in pairs for u, i in zip(predictions.uid, predictions.iid)], index=predictions.index)
+        result["subsets"] = {}
+        for name, mask in (("Seen", seen), ("Unseen", ~seen)):
+            subset = predictions.loc[mask]
+            result["subsets"][name] = ranking_metrics(subset.uid, subset.label, subset.score)
+    state = {name: value.detach().cpu() for name, value in model.state_dict().items()
+             if name.startswith(("rec_encoder.", "llama_proj.")) or "lora_" in name}
+    torch.save({"model": state, "model_config": model_config, "backbone": args.backbone}, output / "recommender.pt")
+    write_json(output / "test_metrics.json", result)
+    print(json.dumps(result, indent=2))
 
-    task = tasks.setup_task(cfg)
-    datasets = task.build_datasets(cfg)
-    
-    # 获取数据路径并计算 user/item num
-    try:
-        # 尝试获取 movie_ood (ML-1M) 或 amazon_ood
-        data_dir = cfg.datasets_cfg.get("movie_ood", cfg.datasets_cfg.get("amazon_ood")).path
-    except AttributeError:
-        # Fallback 逻辑
-        data_name = list(datasets.keys())[0]
-        data_dir = cfg.datasets_cfg[data_name].path
-
-    print(f"Data directory: {data_dir}")
-    
-    # 加载数据以计算统计信息
-    # 注意：这里假设目录包含 .pkl 文件
-    train_ = pd.read_pickle(f"{data_dir}/train_ood2.pkl")
-    valid_ = pd.read_pickle(f"{data_dir}/valid_ood2.pkl")
-    test_ = pd.read_pickle(f"{data_dir}/test_ood2.pkl")
-    
-    user_num = max(train_.uid.max(), valid_.uid.max(), test_.uid.max()) + 1
-    item_num = max(train_.iid.max(), valid_.iid.max(), test_.iid.max()) + 1
-
-    cfg.model_cfg.rec_config.user_num = int(user_num)
-    cfg.model_cfg.rec_config.item_num = int(item_num)
-    
-    cfg.pretty_print()
-
-    model = task.build_model(cfg)
-    runner = get_runner_class(cfg)(
-        cfg=cfg, job_id=job_id, task=task, model=model, datasets=datasets
-    )
-    runner.train()
 
 if __name__ == "__main__":
     main()

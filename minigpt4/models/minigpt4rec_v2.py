@@ -8,11 +8,11 @@ import os
 
 from minigpt4.common.registry import registry
 from minigpt4.models.rec_model import Rec2Base, disabled_train
-from minigpt4.models.modeling_llama import LlamaForCausalLM
+from transformers import LlamaForCausalLM
 from transformers import LlamaTokenizer, GenerationConfig
 import re
 import numpy as np
-from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, prepare_model_for_int8_training, set_peft_model_state_dict
+from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 
 def get_ids_order(prompt):
     id_flags = ["<UserID>", "<ItemIDList>", "<TargetItemID>"]
@@ -77,7 +77,9 @@ class MiniGPT4Rec_v2(Rec2Base):
         lora_config=None,
         proj_mid=5,
         freeze_lora=False,
-        freeze_proj=False
+        freeze_proj=False,
+        upstream_adapter=None,
+        initialization_seed=None
     ):
         super().__init__()
 
@@ -127,10 +129,18 @@ class MiniGPT4Rec_v2(Rec2Base):
                 torch_dtype=torch.float16,
             )
 
+        if upstream_adapter:
+            if self.low_resource:
+                raise ValueError("Merge upstream adapters before enabling quantized downstream loading.")
+            exposed_model = PeftModel.from_pretrained(self.llama_model, upstream_adapter, is_trainable=False)
+            self.llama_model = exposed_model.merge_and_unload(safe_merge=True)
+        self.llama_model.config.use_cache = False
         for name, param in self.llama_model.named_parameters():
             param.requires_grad = False
         print('Loading LLAMA Done')
 
+        if initialization_seed is not None:
+            torch.manual_seed(int(initialization_seed))
         self.use_lora = False
         if lora_config is not None and lora_config.use_lora:
             print("Setting Lora")
@@ -146,7 +156,7 @@ class MiniGPT4Rec_v2(Rec2Base):
             self.llama_model_lora = get_peft_model(self.llama_model, peft_config)
             print("Setting Lora Done")
         
-        if freeze_lora:
+        if freeze_lora and self.use_lora:
             print("freeze lora...")
             for name, param in self.llama_model_lora.named_parameters():
                 param.requires_grad = False
@@ -208,7 +218,7 @@ class MiniGPT4Rec_v2(Rec2Base):
         # else:
         #     self.prompt_list = []
         if prompt_path:
-            with open(prompt_path, 'r') as f:
+            with open(prompt_path, 'r', encoding='utf-8') as f:
                 raw_prompts = f.read().splitlines()
             # filted_prompts = [raw_prompt for raw_prompt in raw_prompts if "<UserID>" in raw_prompt]
             filted_prompts = [raw_prompt for raw_prompt in raw_prompts]
@@ -479,69 +489,41 @@ class MiniGPT4Rec_v2(Rec2Base):
 
 
         
-    def recprompt_wrap_v2(self, samples, ori_samples, atts_sample, prompt): # used for stage 2
-        if prompt:
-            prompt_ori = prompt
-            split_symbol = ["<UserID>", "<ItemIDList>", "<ItemTitleList>", "<TargetItemID>", "<TargetItemTitle>"]
-            batch_size = ori_samples['UserID'].shape[0]
-            bos = "<s>"
-            unk_ = self.llama_tokenizer.unk_token #"<unk>"
-            unk_ = ".".join([unk_]*self.proj_token_num)
-            prompt = bos + prompt # add the bos
-            prompt = prompt.replace("<UserID>", unk_)
-            prompt = prompt.replace("<TargetItemID>", unk_)
+    def recprompt_wrap_v2(self, samples, ori_samples, atts_sample, prompt):
+        """Insert collaborative vectors at explicit markers, independent of unknown text tokens."""
+        batch_size = len(ori_samples["UserID"])
+        embedding = self.llama_model.get_input_embeddings()
+        device = ori_samples["UserID"].device
+        sequences = []
+        marker_pattern = r"(<UserID>|<TargetItemID>|<DCNFeature>|<ItemIDList>)"
+        for index in range(batch_size):
+            text = prompt.replace("<ItemTitleList>", ori_samples["InteractedItemTitles"][index])
+            text = text.replace("<TargetItemTitle>", ori_samples["TargetItemTitle"][index])
+            bos = torch.tensor([self.llama_tokenizer.bos_token_id], device=device)
+            chunks = [embedding(bos)]
+            for segment in re.split(marker_pattern, text):
+                if segment in ("<UserID>", "<DCNFeature>"):
+                    chunks.append(samples["User_emb"][index].to(chunks[0].dtype))
+                elif segment == "<TargetItemID>":
+                    chunks.append(samples["TargetItem_emb"][index].to(chunks[0].dtype))
+                elif segment == "<ItemIDList>":
+                    raise ValueError("Use user/target features for the CoLLM-MF and CoLLM-DIN prompts.")
+                elif segment:
+                    ids = self.llama_tokenizer.encode(segment, add_special_tokens=False)
+                    if ids:
+                        chunks.append(embedding(torch.tensor(ids, device=device, dtype=torch.long)))
+            sequence = torch.cat(chunks, dim=0)
+            if len(sequence) > self.max_txt_len:
+                raise ValueError("Recommendation prompt exceeds max_txt_len; shorten history or increase the budget.")
+            sequences.append(sequence)
+        width = max(len(sequence) for sequence in sequences)
+        masks, padded = [], []
+        for sequence in sequences:
+            padding = width - len(sequence)
+            padded.append(torch.cat([sequence.new_zeros((padding, sequence.shape[-1])), sequence], dim=0))
+            masks.append([0] * padding + [1] * len(sequence))
+        return torch.stack(padded), torch.tensor(masks, dtype=torch.long, device=device)
 
-            prompt = prompt.replace("<DCNFeature>", unk_)
-
-            # interactedItems = samples['InteractedItemTitles']
-            prompt_list = []
-            
-            
-            for k in range(batch_size):
-                prompt_ = prompt+""
-                # prompt_ = prompt.replace('UserID',unk_)
-                # item_num = samples['interacted']
-                if 'InteractedNum' in ori_samples.keys():
-                    prompt_ = prompt_.replace('<ItemIDList>', ', '.join([unk_]*ori_samples['InteractedNum'][k]))
-                    prompt_ = prompt_.replace("<ItemTitleList>", ori_samples['InteractedItemTitles'][k])
-                prompt_ = prompt_.replace("<TargetItemTitle>", ori_samples['TargetItemTitle'][k])
-                # prompt_ = prompt_.replace("<TargetItemID>", unk_)
-                # prompt_ += samples['Response'][k]
-                prompt_list.append(prompt_)
-            
-            if not self.has_print_prompt:
-                print("prompt example:", random.choice(prompt_list))
-                self.has_print_prompt = True
-            
-            # print(prompt_list[0])
-            
-            self.llama_tokenizer.padding_side = "left"
-            prompts_tokens = self.llama_tokenizer(
-            prompt_list,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-            add_special_tokens=False
-        ).to(ori_samples['UserID'].device)
-            unk_token_id = self.llama_tokenizer.unk_token_id
-            if not self.has_pri_decode:
-                print("#######prmpt decoded example: ",' '.join(self.llama_tokenizer.batch_decode(prompts_tokens.input_ids[0])))
-                self.has_pri_decode = True
-                
-
-            replaced_idx = torch.nonzero(prompts_tokens.input_ids==unk_token_id)
-            prompt_embeds = self.llama_model.model.embed_tokens(prompts_tokens.input_ids)
-            # prompt_embeds[replaced_idx[:,0],replaced_idx[:,1]] = samples['merged_embs']
-            if "<UserID>" in prompt_ori  and "<ItemIDList>" in prompt_ori and  "<TargetItemID>" in prompt_ori:
-                prompt_embeds[replaced_idx[:,0],replaced_idx[:,1]] = samples['merged_embs']
-            elif "<UserID>" in prompt_ori and "<TargetItemID>" in prompt_ori and "<ItemIDList>" not in prompt_ori:
-                prompt_embeds[replaced_idx[:,0],replaced_idx[:,1]] = torch.cat([samples['User_emb'], samples['TargetItem_emb']],dim=-2).reshape(-1,samples['User_emb'].shape[-1])
-            elif "<DCNFeature>" in prompt_ori:
-                prompt_embeds[replaced_idx[:,0],replaced_idx[:,1]] = samples['User_emb'].reshape(-1,samples['User_emb'].shape[-1])
-            else:
-                pass 
-            return prompt_embeds, prompts_tokens.attention_mask
 
 
 
@@ -643,92 +625,24 @@ class MiniGPT4Rec_v2(Rec2Base):
 
 
     def forward_v2(self, samples):
-        user_selective_prompts = False
-        # sample = samples["image"]
-        if hasattr(samples, 'question_split'):  # VQA dataset
-            print('VQA Batch')
-            raise NotImplementedError("not implement")
-            # vqa_prompt = '###Human: <Img><ImageHere></Img> '
-            # img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img, vqa_prompt)
-        elif self.prompt_list:
-            # if user_selective_prompts:  # automatically setting prompt according to the prompt_flag
-            #     prompt_flag = samples['prompt_flag']
-            #     unique_flags = torch.unique(prompt_flag)
-            #     sample_embeds = []
-            #     atts_samples = []
-            #     true_idx = torch.zeros_like(prompt_flag)
-            #     pre_ = 0
-            #     for k_flag in unique_flags:
-            #         idx_k = torch.nonzero(prompt_flag==k_flag)[0]
-            #         true_idx[idx_k] = pre_ + torch.arange(idx_k.shape[0])
-            #         pre_ += idx_k.shape[0]
-            #         sub_k_sample = {}
-            #         for key_ in samples.keys():
-            #             sub_k_sample[key_] = samples[key_][idx_k]
-            #         sample_embeds_k, atts_samples_k = self.prompt_based_encode_v2(self.prompt_list[k_flag], sub_k_sample)
-            #         sample_embeds.append(sample_embeds_k)
-            #         atts_samples.append(atts_samples_k)
-            #     sample_embeds = torch.cat(sample_embeds, dim=0)
-            #     atts_samples = torch.cat(atts_samples,dim=0)
-            #     sample_embeds = sample_embeds[true_idx]
-            #     atts_samples = atts_samples[true_idx]
-            # else:
-            prompt = random.choice(self.prompt_with_p([5,5,5,1])) #[1,5,3,1]  #[2,5,3,1]
-            sample_embeds, atts_samples = self.prompt_based_encode_v2(prompt,samples)
-            # id_orders = get_ids_order(prompt)
-            # samples_encode, atts_samples = self.encode_recdata_v2(samples,ids_order=id_orders)
-            # sample_embeds, atts_samples = self.recprompt_wrap_v2(samples_encode, samples, atts_samples, prompt)
-
-        self.llama_tokenizer.padding_side = "right"
-        device = samples['UserID'].device #samples_encode['User_emb'].device
-
-        ans_ = {1:self.pos_ans[0], 0:self.neg_ans[0]}
-
-        text = [ans_[int(t)] for t in samples["label"]] 
-
-        to_regress_tokens = self.llama_tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-            add_special_tokens=False
-        ).to(device)
-
-        t_posi = to_regress_tokens.input_ids.shape[-1] + 1
-
-        targets = to_regress_tokens.input_ids.masked_fill(
-            to_regress_tokens.input_ids == self.llama_tokenizer.pad_token_id, -100
-        )
-        empty_targets = torch.ones([atts_samples.shape[0],atts_samples.shape[1]],dtype=torch.long).to(device).fill_(-100)
-        targets = torch.cat([empty_targets, targets], dim=1)
-        to_regress_embeds = self.llama_model.model.embed_tokens(to_regress_tokens.input_ids)
-        inputs_embeds = torch.cat([sample_embeds, to_regress_embeds], dim=1)
-        attention_mask = torch.cat([atts_samples, to_regress_tokens.attention_mask], dim=1)
-
-        with self.maybe_autocast():
-            if not self.use_lora:
-                outputs = self.llama_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    labels=targets,
-                )
-            else:
-                outputs = self.llama_model_lora(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    labels=targets,
-                )
-        # loss = outputs.loss
-
-        # new loss, just focus on the target pos and neg tokens 
-        pos_ans_id = self.llama_tokenizer(ans_[int(1)],add_special_tokens=False).input_ids[0]
-        neg_ans_id = self.llama_tokenizer(ans_[int(0)],add_special_tokens=False).input_ids[0]
-        logits = outputs.logits[:,-t_posi,:][:,pos_ans_id]
-        loss = nn.functional.binary_cross_entropy_with_logits(logits, samples['label'].float()) #+ 1e-7 * samples_encode['loss_c']
+        prompt = random.choice(self.prompt_list)
+        logits = self._recommendation_logits(samples, prompt)
+        loss = nn.functional.binary_cross_entropy_with_logits(logits.float(), samples["label"].float())
         return {"loss": loss}
+
+    def _recommendation_logits(self, samples, prompt):
+        embeddings, attention_mask = self.prompt_based_encode_v2(prompt, samples)
+        model = self.llama_model_lora if self.use_lora else self.llama_model
+        position_ids = attention_mask.cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
+        with self.maybe_autocast():
+            outputs = model(inputs_embeds=embeddings, attention_mask=attention_mask,
+                            position_ids=position_ids, return_dict=True, use_cache=False)
+        token_ids = self.llama_tokenizer.encode(self.pos_ans[0], add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError("Positive answer must tokenize to one token for recommendation scoring.")
+        return outputs.logits[:, -1, token_ids[0]]
+
 
 
 
@@ -740,130 +654,13 @@ class MiniGPT4Rec_v2(Rec2Base):
 #                 }
 
 
-    def generate_for_samples_v2(self, samples,return_all=False):
-        # sample = samples["image"]
-        user_selective_prompts = False
-        if hasattr(samples, 'question_split'):  # VQA dataset
-            print('VQA Batch')
-            raise NotImplementedError("not implement")
-            # vqa_prompt = '###Human: <Img><ImageHere></Img> '
-            # img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img, vqa_prompt)
-        elif self.prompt_list:
-            if user_selective_prompts:  # automatically setting prompt according to the prompt_flag
-                prompt_flag = samples['prompt_flag']
-                unique_flags = torch.unique(prompt_flag)
-                sample_embeds = []
-                atts_samples = []
-                true_idx = torch.zeros_like(prompt_flag)
-                pre_ = 0
-                for k_flag in unique_flags:
-                    idx_k = torch.nonzero(prompt_flag==k_flag)[0]
-                    true_idx[idx_k] = pre_ + torch.arange(idx_k.shape[0])
-                    pre_ += idx_k.shape[0]
-                    sub_k_sample = {}
-                    for key_ in samples.keys():
-                        sub_k_sample[key_] = samples[key_][idx_k]
-                    if k_flag == 0:   # assume the fist prompt does not use ID information, for cold items
-                        used_prompt = self.prompt_list[-1]
-                    else:
-                        used_prompt = self.prompt_list[1] # during inference, use ID+title information by default.
-                    sample_embeds_k, atts_samples_k = self.prompt_based_encode_v2(used_prompt, sub_k_sample)
-                    sample_embeds.append(sample_embeds_k)
-                    atts_samples.append(atts_samples_k)
-                sample_embeds = torch.cat(sample_embeds, dim=0)
-                atts_samples = torch.cat(atts_samples,dim=0)
-                sample_embeds = sample_embeds[true_idx]
-                atts_samples = atts_samples[true_idx]
-            else:
-                prompt = self.prompt_list[0]
-                sample_embeds, atts_samples = self.prompt_based_encode_v2(prompt,samples)
-                # id_orders = get_ids_order(prompt)
-                # samples_encode, atts_samples = self.encode_recdata_v2(samples,ids_order=id_orders)
-                # sample_embeds, atts_samples = self.recprompt_wrap_v2(samples_encode, samples, atts_samples, prompt)
-
-        self.llama_tokenizer.padding_side = "right"
-
-
-
-        device = samples['UserID'].device #samples_encode['User_emb'].device
-
-        pos_ans = self.pos_ans[0]
-        neg_ans = self.neg_ans[0]
-        ans_ = {1:pos_ans, 0:neg_ans}
-
-        ans_ = {1:pos_ans, 0:neg_ans}
-
-        # text = ["### Response: " + ans_[int(t)]  for t in samples["label"]]
-        text = [ ans_[int(t)]  for t in samples["label"]]
-
-        to_regress_tokens = self.llama_tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-            add_special_tokens=False
-        ).to(device)
-
-        t_posi = to_regress_tokens.input_ids.shape[-1] + 1
-
-        # print("labels:",samples["label"],"token:",to_regress_tokens)
-
-        targets = to_regress_tokens.input_ids.masked_fill(
-            to_regress_tokens.input_ids == self.llama_tokenizer.pad_token_id, -100
-        )
-        empty_targets = torch.ones([atts_samples.shape[0],atts_samples.shape[1]],dtype=torch.long).to(device).fill_(-100)
-
-        # empty_targets = (
-        #     torch.ones([atts_img.shape[0], atts_img.shape[1]+1],
-        #                dtype=torch.long).to(image.device).fill_(-100)  # plus one for bos
-        # )
-        targets = torch.cat([empty_targets, targets], dim=1)
-
-        # batch_size = img_embeds.shape[0]
-        # bos = torch.ones([batch_size, 1],
-        #                  dtype=to_regress_tokens.input_ids.dtype,
-        #                  device=to_regress_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id
-        # bos_embeds = self.llama_model.model.embed_tokens(bos)
-        # atts_bos = atts_img[:, :1]
-
-        to_regress_embeds = self.llama_model.model.embed_tokens(to_regress_tokens.input_ids)
-        inputs_embeds = torch.cat([sample_embeds, to_regress_embeds], dim=1)
-        attention_mask = torch.cat([atts_samples, to_regress_tokens.attention_mask], dim=1)
-
-        with self.maybe_autocast():
-            if not self.use_lora:
-                outputs = self.llama_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    labels=targets,
-                )
-            else:
-                outputs = self.llama_model_lora(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    labels=targets,
-                )
-        # loss = outputs.loss
-        pos_ans_id = self.llama_tokenizer(pos_ans, add_special_tokens=False).input_ids[0]
-        neg_ans_id = self.llama_tokenizer(neg_ans, add_special_tokens=False).input_ids[0]
-
-        # logits = outputs.logits[:,-2,:][:,[neg_ans_id, pos_ans_id]]
-        # logits_ = torch.ones_like(logits[:,0]).float()
-        # logits_ = torch.where(logits[:,0]>logits[:,1],0,logits_)
-        # logits_ = torch.where(logits[:,0]==logits[:,1],0.5,logits_)
-
-        logits_ = outputs.logits[:,-t_posi,:][:,pos_ans_id]
-        # print(lo)
-        loss = nn.functional.binary_cross_entropy_with_logits(logits_, samples['label'].float())
-
+    def generate_for_samples_v2(self, samples, return_all=False):
+        logits = self._recommendation_logits(samples, self.prompt_list[0])
+        loss = nn.functional.binary_cross_entropy_with_logits(logits.float(), samples["label"].float())
         if return_all:
-            return outputs, logits_
+            return {"logits": logits}, logits
+        return {"loss": loss, "logits": logits}
 
-
-        return {"loss": loss, 'logits':logits_}
     
 
 
@@ -1147,7 +944,9 @@ class MiniGPT4Rec_v2(Rec2Base):
             lora_config = lora_config,
             proj_mid = proj_mid,
             freeze_lora=freeze_lora,
-            freeze_proj=freeze_proj
+            freeze_proj=freeze_proj,
+            upstream_adapter=cfg.get("upstream_adapter"),
+            initialization_seed=cfg.get("initialization_seed")
         )
 
         ckpt_path = cfg.get("ckpt", "")  # load weights of MiniGPT-4

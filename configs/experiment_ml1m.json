@@ -1,0 +1,137 @@
+{
+  "dataset": "ml-1m",
+  "seed": 42,
+  "base_model": "models/vicuna-7b",
+  "data_dir": "dataset/ml-1m",
+  "history_length": 10,
+  "exposure": {
+    "id_ratio": 0.1,
+    "ood_ratio": 0.6
+  },
+  "ood_sources": {
+    "epinions": "dataset/ood/epinions.jsonl",
+    "lastfm": "dataset/ood/lastfm.jsonl",
+    "mind": "dataset/ood/mind.jsonl",
+    "amazon-sports": "dataset/ood/amazon-sports.jsonl",
+    "amazon-beauty": "dataset/ood/amazon-beauty.jsonl",
+    "gowalla": "dataset/ood/gowalla.jsonl"
+  },
+  "upstream": {
+    "epochs": 3,
+    "max_steps": -1,
+    "batch_size": 2,
+    "gradient_accumulation_steps": 64,
+    "learning_rate": 0.0002,
+    "min_learning_rate": 1e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.0,
+    "max_length": 1024,
+    "precision": "fp16",
+    "gradient_checkpointing": true,
+    "lora": {
+      "rank": 8,
+      "alpha": 16,
+      "dropout": 0.05,
+      "target_modules": [
+        "q_proj",
+        "v_proj"
+      ]
+    }
+  },
+  "downstream": {
+    "gradient_checkpointing": true,
+    "lora": {
+      "rank": 8,
+      "alpha": 16,
+      "dropout": 0.05,
+      "target_modules": [
+        "q_proj",
+        "v_proj"
+      ]
+    }
+  },
+  "methods": {
+    "CoLLM-MF": {
+      "model_config": "train_configs/collm_pretrain_mf_ood.yaml",
+      "pretrained_encoder": null,
+      "encoder": {
+        "embedding_size": 256,
+        "drop": 0.0
+      },
+      "encoder_training": {
+        "epochs": 50,
+        "learning_rate": 0.001,
+        "min_learning_rate": 1e-05,
+        "batch_size": 1024,
+        "eval_batch_size": 1024,
+        "gradient_accumulation_steps": 1,
+        "patience": 5,
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0
+      },
+      "alignment": {
+        "epochs": 5,
+        "learning_rate": 0.0002,
+        "min_learning_rate": 1e-05,
+        "batch_size": 2,
+        "eval_batch_size": 2,
+        "gradient_accumulation_steps": 64,
+        "patience": 3,
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0
+      },
+      "finetuning": {
+        "epochs": 5,
+        "learning_rate": 0.0002,
+        "min_learning_rate": 1e-05,
+        "batch_size": 2,
+        "eval_batch_size": 2,
+        "gradient_accumulation_steps": 64,
+        "patience": 3,
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0
+      }
+    },
+    "CoLLM-DIN": {
+      "model_config": "train_configs/collm_pretrain_din_ood_cc.yaml",
+      "pretrained_encoder": null,
+      "encoder": {
+        "embedding_size": 192,
+        "drop": 0.2
+      },
+      "encoder_training": {
+        "epochs": 50,
+        "learning_rate": 0.0001,
+        "min_learning_rate": 1e-05,
+        "batch_size": 256,
+        "eval_batch_size": 256,
+        "gradient_accumulation_steps": 1,
+        "patience": 5,
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0
+      },
+      "alignment": {
+        "epochs": 5,
+        "learning_rate": 0.0002,
+        "min_learning_rate": 1e-05,
+        "batch_size": 2,
+        "eval_batch_size": 2,
+        "gradient_accumulation_steps": 64,
+        "patience": 3,
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0
+      },
+      "finetuning": {
+        "epochs": 5,
+        "learning_rate": 0.0002,
+        "min_learning_rate": 1e-05,
+        "batch_size": 2,
+        "eval_batch_size": 2,
+        "gradient_accumulation_steps": 64,
+        "patience": 3,
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0
+      }
+    }
+  }
+}

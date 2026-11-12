@@ -26,4 +26,4 @@ echo "Please download Amazon-Beauty from: https://jmcauley.ucsd.edu/data/amazon/
 # Source: https://snap.stanford.edu/data/loc-gowalla.html
 echo "Please download Gowalla dataset from: https://snap.stanford.edu/data/loc-gowalla.html"
 
-echo "After downloading, place the raw data files in the 'dataset/ood/' directory."
+echo "Place raw data in 'dataset/raw/'; use prepare_ood_raw.py or prepare_ood.py to create JSONL files in 'dataset/ood/'."

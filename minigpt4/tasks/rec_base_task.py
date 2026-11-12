@@ -233,7 +233,7 @@ class RecBaseTask(BaseTask):
                 print("finished comput auc.....")
             else:
                 auc = roc_auc_score(labels_.cpu().numpy(), results_logits_.cpu().numpy())
-                uauc = uAUC_me(users_.cpu().numpy(), results_logits_.cput().numpy(), labels_.cpu().numpy())
+                uauc, _, _ = uAUC_me(users_.cpu().numpy(), results_logits_.cpu().numpy(), labels_.cpu().numpy())
             
 
             if is_dist_avail_and_initialized():

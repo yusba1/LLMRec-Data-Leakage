@@ -4,4 +4,4 @@ env:
   # For internal use with persistent storage
   # cache_root: "/export/home/.cache/minigpt4"
   # cache_root: "/home/sist/zyang/.cache/minigpt4"
-  cache_root: "/data/zyang/.cache/minigpt4"
+  cache_root: ".cache/minigpt4"
